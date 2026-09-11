@@ -28,13 +28,21 @@ async def main() -> None:
         server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=args.port, log_level="warning"))
         web_task = asyncio.create_task(server.serve())
         try:
-            await run_cli(args.target, args.rate)
+            await asyncio.sleep(0.2)
+            # The same scan events feed both the CLI and browser in a single process.
+            await run_scan(args.target, args.rate)
         finally:
             server.should_exit = True
             await web_task
     elif args.web:
-        await run_scan(args.target, args.rate)
-        uvicorn.run(app, host="127.0.0.1", port=args.port)
+        server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=args.port, log_level="warning"))
+        web_task = asyncio.create_task(server.serve())
+        try:
+            await asyncio.sleep(0.2)
+            await run_scan(args.target, args.rate)
+        finally:
+            server.should_exit = True
+            await web_task
     else:
         await run_cli(args.target, args.rate)
 
