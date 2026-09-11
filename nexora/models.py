@@ -31,7 +31,7 @@ class Subnet:
     status: str = "queued"
     confidence: float = 0.0
     hosts: set[str] = field(default_factory=set)
-    evidence: list[str] = field(default_factory=list)
+    evidence: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
