@@ -101,13 +101,27 @@ class Cartographer:
         self.subnets: dict[str, Subnet] = {}
         self.hosts: dict[str, Host] = {}
         self.links: list[Link] = []
+        self._link_keys: set[tuple[str, str, str]] = set()
 
-    async def scan_subnet(self, cidr: str, sink: EventSink, parent: str | None = None) -> None:
+    async def scan_subnet(
+        self,
+        cidr: str,
+        sink: EventSink,
+        parent: str | None = None,
+        max_hosts: int | None = None,
+    ) -> None:
         network = ipaddress.ip_network(cidr, strict=False)
         subnet = self.subnets.setdefault(cidr, Subnet(cidr=cidr, parent=parent, status="discovering"))
+        if parent and not subnet.parent:
+            subnet.parent = parent
         await emit(sink, "SUBNET_STARTED", cidr=cidr, parent=parent)
 
-        for address in network.hosts():
+        addresses = network.hosts()
+        for index, address in enumerate(addresses):
+            if max_hosts is not None and index >= max_hosts:
+                subnet.status = "partial"
+                subnet.evidence["host_limit"] = max_hosts
+                break
             ip = str(address)
             alive, latency = await icmp_check(ip)
             if not alive:
@@ -127,8 +141,9 @@ class Cartographer:
             await emit(sink, "HOST_DISCOVERED", ip=ip, subnet=cidr, latency_ms=latency)
             await self.enumerate_host(host, sink)
 
-        subnet.status = "mapped"
-        await emit(sink, "SUBNET_COMPLETED", cidr=cidr, hosts=len(subnet.hosts))
+        if subnet.status != "partial":
+            subnet.status = "mapped"
+        await emit(sink, "SUBNET_COMPLETED", cidr=cidr, hosts=len(subnet.hosts), status=subnet.status)
 
     async def enumerate_host(self, host: Host, sink: EventSink) -> None:
         for port in self.ports:
@@ -149,8 +164,11 @@ class Cartographer:
         previous = None
         for hop in path:
             if previous:
-                self.links.append(Link(previous, hop, "traceroute", 0.75, "traceroute observation"))
-                await emit(sink, "LINK_FOUND", source=previous, destination=hop, kind="traceroute", confidence=0.75)
+                key = (previous, hop, "traceroute")
+                if key not in self._link_keys:
+                    self._link_keys.add(key)
+                    self.links.append(Link(previous, hop, "traceroute", 0.75, "traceroute observation"))
+                    await emit(sink, "LINK_FOUND", source=previous, destination=hop, kind="traceroute", confidence=0.75)
             previous = hop
         if path:
             await emit(sink, "PATH_FOUND", target=host.ip, hops=path)
