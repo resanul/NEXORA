@@ -8,24 +8,17 @@ from .engine import Cartographer
 from .models import Event
 
 EventSink = Callable[[Event], Awaitable[None]]
+RFC1918 = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
 
 
 class Frontier:
-    """Bounded autonomous frontier for private-network discovery.
+    """Bounded autonomous frontier for explicitly authorized private networks."""
 
-    Expansion is deliberately opt-in. Only RFC1918 IPv4 traceroute hops are
-    promoted to subnet candidates, and every candidate is still scanned using
-    the normal low-impact Cartographer probes.
-    """
-
-    def __init__(
-        self,
-        seed: str,
-        max_subnets: int = 16,
-        max_hosts_per_subnet: int = 256,
-        prefix: int = 24,
-        expand: bool = False,
-    ) -> None:
+    def __init__(self, seed: str, max_subnets: int = 16, max_hosts_per_subnet: int = 256, prefix: int = 24, expand: bool = False) -> None:
         self.seed = str(ipaddress.ip_network(seed, strict=False))
         self.max_subnets = max(1, max_subnets)
         self.max_hosts_per_subnet = max(1, max_hosts_per_subnet)
@@ -39,13 +32,9 @@ class Frontier:
             ip = ipaddress.ip_address(address)
         except ValueError:
             return None
-        if ip.version != 4 or not ip.is_private:
+        if ip.version != 4 or not any(ip in network for network in RFC1918):
             return None
-        network = ipaddress.ip_network(f"{ip}/{self.prefix}", strict=False)
-        # Avoid turning documentation/test-only space or loopback into scope.
-        if network.is_loopback or network.is_link_local:
-            return None
-        return str(network)
+        return str(ipaddress.ip_network(f"{ip}/{self.prefix}", strict=False))
 
     def _promote_paths(self, cartographer: Cartographer, parent: str) -> None:
         if not self.expand:
@@ -60,12 +49,7 @@ class Frontier:
         while self.queue and len(cartographer.subnets) < self.max_subnets:
             cidr, parent = self.queue.popleft()
             await sink(Event("SUBNET_QUEUED", {"cidr": cidr, "parent": parent}))
-            await cartographer.scan_subnet(
-                cidr,
-                sink,
-                parent=parent,
-                max_hosts=self.max_hosts_per_subnet,
-            )
+            await cartographer.scan_subnet(cidr, sink, parent=parent, max_hosts=self.max_hosts_per_subnet)
             self._promote_paths(cartographer, cidr)
             await sink(Event("SUBNET_FRONTIER_UPDATED", {
                 "completed": len(cartographer.subnets),
