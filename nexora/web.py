@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from collections import deque
 
 from fastapi import FastAPI, WebSocket
@@ -8,9 +7,10 @@ from fastapi.responses import HTMLResponse
 
 from .db import Database
 from .engine import Cartographer
+from .frontier import Frontier
 from .models import Event
 
-app = FastAPI(title="NEXORA", version="0.1.0")
+app = FastAPI(title="NEXORA", version="0.2.0")
 cartographer = Cartographer()
 db = Database()
 event_history: deque[dict] = deque(maxlen=500)
@@ -58,16 +58,28 @@ async def index():
     return HTMLResponse(INDEX)
 
 
-async def run_scan(target: str, probes_per_second: float = 2.0):
+async def run_scan(
+    target: str,
+    probes_per_second: float = 2.0,
+    expand: bool = False,
+    max_subnets: int = 16,
+    max_hosts_per_subnet: int = 256,
+):
     global cartographer
     cartographer = Cartographer(probes_per_second=probes_per_second)
-    await cartographer.scan_subnet(target, sink)
+    frontier = Frontier(
+        target,
+        max_subnets=max_subnets,
+        max_hosts_per_subnet=max_hosts_per_subnet,
+        expand=expand,
+    )
+    await frontier.run(cartographer, sink)
     db.snapshot(cartographer)
 
 
 INDEX = r'''<!doctype html>
 <html><head><meta charset="utf-8"><title>NEXORA</title>
-<style>body{margin:0;background:#07111f;color:#dbeafe;font:14px system-ui}header{padding:16px 22px;border-bottom:1px solid #1e293b}main{display:grid;grid-template-columns:1fr 330px;height:calc(100vh - 65px)}#map{position:relative;overflow:auto;padding:30px}.card{background:#0f1b2d;border:1px solid #26364d;border-radius:12px;padding:14px;margin:10px}.node{display:inline-block;margin:10px;padding:12px 16px;border:1px solid #3b82f6;border-radius:10px;background:#0b1728}.muted{color:#94a3b8}.event{font-size:12px;margin:7px 0}</style></head>
+<style>body{margin:0;background:#07111f;color:#dbeafe;font:14px system-ui}header{padding:16px 22px;border-bottom:1px solid #1e293b}main{display:grid;grid-template-columns:1fr 330px;height:calc(100vh - 65px)}#map{position:relative;overflow:auto;padding:30px}.card{background:#0f1b2d;border:1px solid #26364d;border-radius:12px;padding:14px;margin:10px}.node{display:inline-block;margin:10px;padding:12px 16px;border:1px solid #3b82f6;border-radius:10px;background:#0b1728}.muted{color:#94a3b8}.event{font-size:12px;margin:7px 0;word-break:break-word}</style></head>
 <body><header><b>NEXORA</b> — Intelligent Network Cartography <span id="status" class="muted">connecting…</span></header>
 <main><section id="map"><div class="card"><b>Live topology</b><div id="nodes"></div></div></section><aside><div class="card"><b>Statistics</b><div id="stats"></div></div><div class="card"><b>Live events</b><div id="events"></div></div></aside></main>
 <script>
