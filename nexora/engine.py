@@ -4,21 +4,17 @@ import asyncio
 import ipaddress
 import platform
 import re
-import socket
-import subprocess
 import time
 from collections.abc import Awaitable, Callable
 
-from .models import Event, Host, Link, Subnet
+from .models import Event, Host, Link, Subnet, utc_now
 
 DEFAULT_PORTS = [22, 53, 80, 443, 445, 3389, 8080]
-
 EventSink = Callable[[Event], Awaitable[None]]
 
 
 class RateLimiter:
-    """Simple global token spacing limiter; deliberately conservative."""
-
+    """Simple global token-spacing limiter; deliberately conservative."""
     def __init__(self, probes_per_second: float = 2.0):
         self.interval = 1.0 / max(0.1, probes_per_second)
         self._lock = asyncio.Lock()
@@ -41,7 +37,7 @@ async def tcp_check(ip: str, port: int, limiter: RateLimiter, timeout: float = 1
     await limiter.wait()
     started = time.perf_counter()
     try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout)
+        _, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout)
         writer.close()
         await writer.wait_closed()
         return True, (time.perf_counter() - started) * 1000
@@ -87,15 +83,14 @@ async def traceroute(target: str, max_hops: int = 12) -> list[str]:
 
     hops: list[str] = []
     for line in stdout.decode(errors="replace").splitlines():
-        ips = re.findall(r"(?:\d{1,3}\.){3}\d{1,3}", line)
-        if ips:
-            candidate = ips[0]
+        for candidate in re.findall(r"(?:\d{1,3}\.){3}\d{1,3}", line):
             try:
                 ipaddress.ip_address(candidate)
-                if candidate not in hops:
-                    hops.append(candidate)
             except ValueError:
-                pass
+                continue
+            if candidate not in hops:
+                hops.append(candidate)
+                break
     return hops
 
 
@@ -112,13 +107,10 @@ class Cartographer:
         subnet = self.subnets.setdefault(cidr, Subnet(cidr=cidr, parent=parent, status="discovering"))
         await emit(sink, "SUBNET_STARTED", cidr=cidr, parent=parent)
 
-        # Deliberately bound host enumeration. Large networks are handled progressively.
         for address in network.hosts():
             ip = str(address)
             alive, latency = await icmp_check(ip)
             if not alive:
-                # A host may suppress ICMP; a small TCP sample provides a second signal.
-                alive = False
                 for port in (443, 80, 22):
                     ok, port_latency = await tcp_check(ip, port, self.limiter)
                     if ok:
@@ -130,7 +122,7 @@ class Cartographer:
             host = self.hosts.setdefault(ip, Host(ip=ip, subnet=cidr))
             host.reachable = True
             host.latency_ms = latency
-            host.last_seen = host.last_seen
+            host.last_seen = utc_now()
             subnet.hosts.add(ip)
             await emit(sink, "HOST_DISCOVERED", ip=ip, subnet=cidr, latency_ms=latency)
             await self.enumerate_host(host, sink)
@@ -146,6 +138,7 @@ class Cartographer:
                 service = service_name(port)
                 host.services[port] = service
                 await emit(sink, "PORT_FOUND", ip=host.ip, port=port, service=service, latency_ms=latency)
+
         candidates = fingerprint(host)
         host.os_candidates = candidates
         host.confidence = candidates[0]["confidence"] if candidates else 0.0
@@ -164,14 +157,12 @@ class Cartographer:
 
 
 def service_name(port: int) -> str:
-    return {
-        22: "ssh", 53: "dns", 80: "http", 443: "https", 445: "smb", 3389: "rdp", 8080: "http-alt"
-    }.get(port, "unknown")
+    return {22: "ssh", 53: "dns", 80: "http", 443: "https", 445: "smb", 3389: "rdp", 8080: "http-alt"}.get(port, "unknown")
 
 
 def fingerprint(host: Host) -> list[dict]:
     p = set(host.ports)
-    scores: dict[str, float] = {"Linux/Unix": 0.0, "Windows": 0.0, "Network appliance": 0.0}
+    scores = {"Linux/Unix": 0.0, "Windows": 0.0, "Network appliance": 0.0}
     if 22 in p:
         scores["Linux/Unix"] += 0.55
     if 445 in p or 3389 in p:
@@ -181,12 +172,8 @@ def fingerprint(host: Host) -> list[dict]:
     if 80 in p or 443 in p:
         scores["Linux/Unix"] += 0.08
         scores["Windows"] += 0.08
-    total = max(scores.values(), default=0.0)
-    if total == 0:
-        return []
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     top = ranked[0][1]
-    return [
-        {"os": name, "confidence": round(min(0.99, score / max(0.75, top)), 2)}
-        for name, score in ranked if score > 0
-    ]
+    if top <= 0:
+        return []
+    return [{"os": name, "confidence": round(min(0.99, score / max(0.75, top)), 2)} for name, score in ranked if score > 0]
