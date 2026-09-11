@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse
@@ -15,6 +16,7 @@ cartographer = Cartographer()
 db = Database()
 event_history: deque[dict] = deque(maxlen=500)
 clients: set[WebSocket] = set()
+scan_state = {"status": "idle", "target": None, "scan_id": None}
 
 
 async def sink(event: Event) -> None:
@@ -34,11 +36,22 @@ async def sink(event: Event) -> None:
 @app.get("/api/state")
 async def state():
     return {
+        "scan": scan_state,
         "subnets": [s.__dict__ | {"hosts": sorted(s.hosts)} for s in cartographer.subnets.values()],
         "hosts": [h.__dict__ for h in cartographer.hosts.values()],
         "links": [l.__dict__ for l in cartographer.links],
         "events": list(event_history),
     }
+
+
+@app.get("/api/scans")
+async def scans(limit: int = 25):
+    return {"scans": db.recent_scans(limit)}
+
+
+@app.get("/api/events")
+async def events(limit: int = 100):
+    return {"events": db.recent_events(limit)}
 
 
 @app.websocket("/ws")
@@ -65,7 +78,7 @@ async def run_scan(
     max_subnets: int = 16,
     max_hosts_per_subnet: int = 256,
 ):
-    global cartographer
+    global cartographer, scan_state
     cartographer = Cartographer(probes_per_second=probes_per_second)
     frontier = Frontier(
         target,
@@ -73,8 +86,21 @@ async def run_scan(
         max_hosts_per_subnet=max_hosts_per_subnet,
         expand=expand,
     )
-    await frontier.run(cartographer, sink)
-    db.snapshot(cartographer)
+    started = datetime.now(timezone.utc).isoformat()
+    scan_id = db.start_scan(started, target)
+    scan_state = {"status": "running", "target": target, "scan_id": scan_id}
+    await sink(Event("SCAN_STARTED", {"scan_id": scan_id, "target": target}))
+    try:
+        await frontier.run(cartographer, sink)
+        db.snapshot(cartographer, scan_id=scan_id)
+        db.finish_scan(scan_id, datetime.now(timezone.utc).isoformat(), cartographer)
+        scan_state = {"status": "completed", "target": target, "scan_id": scan_id}
+        await sink(Event("SCAN_COMPLETED", {"scan_id": scan_id, "hosts": len(cartographer.hosts), "subnets": len(cartographer.subnets), "links": len(cartographer.links)}))
+    except Exception as exc:
+        db.finish_scan(scan_id, datetime.now(timezone.utc).isoformat(), cartographer, status="failed")
+        scan_state = {"status": "failed", "target": target, "scan_id": scan_id}
+        await sink(Event("SCAN_FAILED", {"scan_id": scan_id, "error": str(exc)}))
+        raise
 
 
 INDEX = r'''<!doctype html>
